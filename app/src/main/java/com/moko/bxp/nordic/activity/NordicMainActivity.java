@@ -112,6 +112,10 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
     // password di default del tag (serve per Verifying/Unlock)
     private static final String DEFAULT_PASSWORD = "Moko4321";
 
+    private String mPendingConnectMac = null;
+    private boolean mWaitingDisconnectToConnect = false;
+
+
 
     private ArrayList<BeaconXInfo> beaconXInfos;
     private BeaconXListAdapter adapter;
@@ -231,11 +235,30 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onConnectStatusEvent(ConnectStatusEvent event) {
         String action = event.getAction();
+
         if (MokoConstants.ACTION_DISCONNECTED.equals(action)) {
+
+            // ✅ Se stavamo aspettando la DISCONNESSIONE per riconnettere (dopo password),
+            // NON azzerare mPassword e NON fare startScan(): riconnettiamo subito.
+            if (mWaitingDisconnectToConnect && !TextUtils.isEmpty(mPendingConnectMac)) {
+                dismissLoadingMessageDialog(); // chiudi eventuale "Syncing/Verifying"
+                // NON dismissLoadingProgressDialog qui se vuoi vedere la rotellina durante la riconnessione
+                // ma se la tua UI resta "bloccata", puoi anche lasciarla aperta.
+
+                final String mac = mPendingConnectMac;
+                mPendingConnectMac = null;
+                mWaitingDisconnectToConnect = false;
+
+                // piccolo delay per stabilità stack BLE
+                mHandler.postDelayed(() -> MokoSupport.getInstance().connDevice(mac), 300);
+                return;
+            }
+
+            // --- comportamento normale ---
             mPassword = "";
-            // 设备断开，通知页面更新
             dismissLoadingProgressDialog();
             dismissLoadingMessageDialog();
+
             if (!mInputPassword && animation == null) {
                 if (isPasswordError) {
                     isPasswordError = false;
@@ -247,12 +270,10 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                 mInputPassword = false;
             }
         }
+
         if (MokoConstants.ACTION_DISCOVER_SUCCESS.equals(action)) {
-            // 设备连接成功，通知页面更新
             dismissLoadingProgressDialog();
-//            BluetoothGattCharacteristic modelNumberChar = MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
-//            BluetoothGattCharacteristic deviceTypeChar = MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_DEVICE_TYPE);
-//            if (modelNumberChar != null && deviceTypeChar != null) {
+
             showLoadingMessageDialog();
             mHandler.postDelayed(() -> {
                 if (TextUtils.isEmpty(mPassword)) {
@@ -266,19 +287,9 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                     MokoSupport.getInstance().sendOrder(orderTasks.toArray(new OrderTask[]{}));
                 }
             }, 500);
-
-//            } else {
-//                MokoSupport.getInstance().disConnectBle();
-//                AlertMessageDialog dialog = new AlertMessageDialog();
-//                dialog.setMessage("The firmware version selected is incorrect. Please back to the firmware version options and select again.");
-//                dialog.setConfirm(R.string.ok);
-//                dialog.setOnAlertConfirmListener(() -> {
-//                    back();
-//                });
-//                dialog.show(getSupportFragmentManager());
-//            }
         }
     }
+
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onOrderTaskResponseEvent(OrderTaskResponseEvent event) {
@@ -328,7 +339,18 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                                         mokoBleScanner.stopScanDevice();
                                     }
                                     showLoadingProgressDialog();
-                                    ivRefresh.postDelayed(() -> MokoSupport.getInstance().connDevice(mSelectedBeaconXMac), 500);
+
+// ✅ connetti SOLO dopo che la disconnessione è completata
+                                    mPendingConnectMac = mSelectedBeaconXMac;
+                                    mWaitingDisconnectToConnect = true;
+
+// sicurezza: se per qualche motivo non arriva DISCONNECTED, tenta comunque dopo 1500ms
+                                    ivRefresh.postDelayed(() -> {
+                                        if (mWaitingDisconnectToConnect && !TextUtils.isEmpty(mPendingConnectMac)) {
+                                            MokoSupport.getInstance().connDevice(mPendingConnectMac);
+                                        }
+                                    }, 1500);
+
                                 }
 
                                 @Override
