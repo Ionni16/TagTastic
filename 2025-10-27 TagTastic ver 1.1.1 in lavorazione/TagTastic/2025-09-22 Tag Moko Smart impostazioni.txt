@@ -1,0 +1,29 @@
+Tag Moko Smart impostazioni, oggetto di riferimento MAC D263A742E7C2
+
+Slot1:
+	URL
+	Adv content:	https://www.	mtsystem.it
+	Parameters:
+	Adv interval:	10	x100ms
+	RSSI@0m:		0dBm
+	Tx power:		0dBm
+	
+	Trigger:		ON
+	Trigger type	Device moves
+	Stop advertising after device keep static for	300 s
+	
+Slot2:
+	No data
+	
+Slot3:
+	No data
+	
+Slot4:
+	No data
+	
+Slot5:
+	No data
+	
+Slot6:
+	No data
+	
