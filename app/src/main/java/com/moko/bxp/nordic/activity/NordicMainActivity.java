@@ -109,6 +109,10 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
     private boolean mStartMitechAutoWriteFlow = false;   // serve per passare l’extra a DeviceInfoActivity
     private static final String MITECH_AUTOWRITE_PASSWORD = "20250430";
 
+    // password di default del tag (serve per Verifying/Unlock)
+    private static final String DEFAULT_PASSWORD = "Moko4321";
+
+
     private ArrayList<BeaconXInfo> beaconXInfos;
     private BeaconXListAdapter adapter;
     private boolean mInputPassword;
@@ -289,59 +293,24 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
             int responseType = response.responseType;
             byte[] value = response.responseValue;
             switch (orderCHAR) {
-                case CHAR_LOCK_STATE:
+                case CHAR_LOCK_STATE: {
                     String valueStr = MokoUtils.bytesToHexString(value);
                     dismissLoadingMessageDialog();
 
                     if ("00".equals(valueStr)) {
-                        // Richiede password
+                        // Serve password
                         MokoSupport.getInstance().disConnectBle();
 
                         if (TextUtils.isEmpty(unLockResponse)) {
                             mInputPassword = true;
 
-                            // ✅ QUI VA INCOLLATO il tuo blocco autowrite (PRIMA del dialog)
-                            if (mMitechAutoWriteRequested) {
-                                mPassword = "Moko4321";
-                                mSavedPassword = "Moko4321";
-
-                                if (!MokoSupport.getInstance().isBluetoothOpen()) {
-                                    MokoSupport.getInstance().enableBluetooth();
-                                    return;
-                                }
-                                if (animation != null) {
-                                    mHandler.removeMessages(0);
-                                    mokoBleScanner.stopScanDevice();
-                                }
-                                showLoadingProgressDialog();
-                                ivRefresh.postDelayed(() -> MokoSupport.getInstance().connDevice(mSelectedBeaconXMac), 500);
-
-                                mMitechAutoWriteRequested = false;
-
-                                return; // IMPORTANTISSIMO: non mostrare PasswordDialog
+                            // ✅ AUTOWRITE: usa password di default
+                            if (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1) {
+                                mSavedPassword = DEFAULT_PASSWORD;
+                            } else {
+                                mPassword = "";
+                                mSavedPassword = "";
                             }
-
-                            // percorso normale (Connect): mostra dialog password
-                            mPassword = "";
-                            mSavedPassword = "";
-                            // --- AUTO: se è richiesto Mitech AutoWrite, NON mostrare PasswordDialog ---
-                            if (mMitechAutoWriteRequested) {
-                                mMitechAutoWriteRequested = false; // evita rientri/loop (QUESTO è dove va quel flag!)
-
-                                mInputPassword = true;
-                                mPassword = MITECH_AUTOWRITE_PASSWORD;
-                                mSavedPassword = MITECH_AUTOWRITE_PASSWORD;
-
-                                if (animation != null) {
-                                    mHandler.removeMessages(0);
-                                    mokoBleScanner.stopScanDevice();
-                                }
-
-                                showLoadingProgressDialog();
-                                ivRefresh.postDelayed(() -> MokoSupport.getInstance().connDevice(mSelectedBeaconXMac), 500);
-                                return; // IMPORTANTISSIMO: non andare sotto, quindi niente dialog
-                            }
-
 
                             PasswordDialog dialog = new PasswordDialog();
                             dialog.setPassword(mSavedPassword);
@@ -352,8 +321,8 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                                         MokoSupport.getInstance().enableBluetooth();
                                         return;
                                     }
-                                    XLog.i(password);
                                     mPassword = password;
+
                                     if (animation != null) {
                                         mHandler.removeMessages(0);
                                         mokoBleScanner.stopScanDevice();
@@ -365,18 +334,18 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                                 @Override
                                 public void onDismiss() {
                                     unLockResponse = "";
-
-                                    mMitechAutoWriteRequested = false;
-
-                                    if (animation == null) {
-                                        startScan();
-                                    }
+                                    if (animation == null) startScan();
                                 }
                             });
+
+                            // ✅ AUTOWRITE: premi OK da solo
+                            if (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1) {
+                                dialog.setAutomaticOk();
+                            }
+
                             dialog.show(NordicMainActivity.this.getSupportFragmentManager());
 
                         } else {
-                            // password errata
                             isPasswordError = true;
                             unLockResponse = "";
                             ToastUtils.showToast(NordicMainActivity.this, "Password incorrect!");
@@ -384,47 +353,42 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
 
                     } else if ("02".equals(valueStr)) {
                         // Non serve password
-                        BluetoothGattCharacteristic modelNumberChar = MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
+                        BluetoothGattCharacteristic modelNumberChar =
+                                MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
+
                         Intent deviceInfoIntent = new Intent(NordicMainActivity.this, DeviceInfoActivity.class);
                         deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_PASSWORD, mPassword);
                         deviceInfoIntent.putExtra(AppConstants.IS_NEW_VERSION, null == modelNumberChar);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mMitechAutoWriteRequested);
 
+                        // ✅ passa flag autowrite
+                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE,
+                                mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
 
-                        // ✅ Passa il flag autowrite
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mMitechAutoWriteRequested);
-                        mMitechAutoWriteRequested = false;
-
+                        mMitechAutoWriteRequested = false; // ✅ evita rientri
                         startActivityForResult(deviceInfoIntent, AppConstants.REQUEST_CODE_DEVICE_INFO);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mStartMitechAutoWriteFlow);
-                        mStartMitechAutoWriteFlow = false; // consumato
-
 
                     } else {
                         // Unlock OK
-                        XLog.i("解锁成功");
                         unLockResponse = "";
                         mSavedPassword = mPassword;
 
-                        BluetoothGattCharacteristic modelNumberChar = MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
+                        BluetoothGattCharacteristic modelNumberChar =
+                                MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
+
                         Intent deviceInfoIntent = new Intent(NordicMainActivity.this, DeviceInfoActivity.class);
                         deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_PASSWORD, mPassword);
                         deviceInfoIntent.putExtra(AppConstants.IS_NEW_VERSION, null == modelNumberChar);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mMitechAutoWriteRequested);
 
+                        // ✅ passa flag autowrite
+                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE,
+                                mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
 
-
-
-                        // ✅ Passa il flag autowrite
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mMitechAutoWriteRequested);
-                        mMitechAutoWriteRequested = false;
-
+                        mMitechAutoWriteRequested = false; // ✅ evita rientri
                         startActivityForResult(deviceInfoIntent, AppConstants.REQUEST_CODE_DEVICE_INFO);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, mStartMitechAutoWriteFlow);
-                        mStartMitechAutoWriteFlow = false; // consumato
-
                     }
                     break;
+                }
+
 
                 case CHAR_UNLOCK:
                     if (responseType == OrderTask.RESPONSE_TYPE_READ) {
@@ -632,10 +596,10 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
             mStartMitechAutoWriteFlow = false;
         } else if (viewId == R.id.tv_mtautowrite) {
             Toast.makeText(this, "tv_mtautowrite cliccato!", Toast.LENGTH_SHORT).show();
-            ((BaseApplication) getApplication()).SetMTAutoWriteStatus(1);
-            mMitechAutoWriteRequested = true;     // IMPORTANT
-            mStartMitechAutoWriteFlow = true;     // IMPORTANT
+            ((BaseApplication)getApplication()).SetMTAutoWriteStatus(1);
+            mMitechAutoWriteRequested = true; // ✅ serve per auto inserire la password di default
         }
+
 
         if (!MokoSupport.getInstance().isBluetoothOpen()) {
             MokoSupport.getInstance().enableBluetooth();
