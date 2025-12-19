@@ -111,7 +111,7 @@ public class UrlFragment extends Fragment implements SeekBar.OnSeekBarChangeList
         // Defaults for new/empty slot
         if (activity.slotData.frameTypeEnum == SlotFrameTypeEnum.NO_DATA) {
             // UI works in 100ms steps, range 1..100
-            etAdvInterval.setText("10"); // 1000ms
+            etAdvInterval.setText("2"); // 200ms
             etAdvInterval.setSelection(etAdvInterval.getText().toString().length());
 
             // SAFE defaults to avoid "radio params not accepted"
@@ -396,7 +396,7 @@ public class UrlFragment extends Fragment implements SeekBar.OnSeekBarChangeList
         if (activity == null || activity.slotData == null) return;
 
         // 10 => 1000ms (valid range 1..100)
-        etAdvInterval.setText("10");
+        etAdvInterval.setText("2");
         etAdvInterval.setSelection(etAdvInterval.getText().toString().length());
 
         // SAFE values to avoid "radio params not accepted"
