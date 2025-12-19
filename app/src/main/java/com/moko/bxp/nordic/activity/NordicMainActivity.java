@@ -1,5 +1,6 @@
 package com.moko.bxp.nordic.activity;
 
+import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.content.BroadcastReceiver;
@@ -7,12 +8,15 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.animation.Animation;
 import android.view.animation.AnimationUtils;
@@ -20,6 +24,11 @@ import android.widget.ImageView;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.core.content.ContextCompat;
+import androidx.recyclerview.widget.DividerItemDecoration;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import com.chad.library.adapter.base.BaseQuickAdapter;
 import com.elvishew.xlog.XLog;
@@ -30,10 +39,11 @@ import com.moko.ble.lib.task.OrderTask;
 import com.moko.ble.lib.task.OrderTaskResponse;
 import com.moko.ble.lib.utils.MokoUtils;
 import com.moko.bxp.nordic.AppConstants;
-import com.moko.bxp.nordic.adapter.BeaconXListAdapter;
+import com.moko.bxp.nordic.BaseApplication;
 import com.moko.bxp.nordic.BuildConfig;
 import com.moko.bxp.nordic.R;
 import com.moko.bxp.nordic.R2;
+import com.moko.bxp.nordic.adapter.BeaconXListAdapter;
 import com.moko.bxp.nordic.dialog.AlertMessageDialog;
 import com.moko.bxp.nordic.dialog.LoadingDialog;
 import com.moko.bxp.nordic.dialog.LoadingMessageDialog;
@@ -54,38 +64,19 @@ import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
 import java.io.File;
+import java.io.FileWriter;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
-
-import androidx.core.content.ContextCompat;
-import androidx.recyclerview.widget.DividerItemDecoration;
-import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
 
 import butterknife.BindView;
 import butterknife.ButterKnife;
-
-// AP
-import com.moko.bxp.nordic.BaseApplication;
-import android.Manifest;
-import android.content.pm.PackageManager;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Locale;
-
-
-import java.io.File;
-import java.io.FileWriter;
-import java.util.List;
-import java.util.ArrayList;
-
-import android.view.Menu;
-import android.view.MenuItem;
-import android.widget.Toast;
-
 
 public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCallback, BaseQuickAdapter.OnItemChildClickListener {
 
@@ -101,28 +92,47 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
     RelativeLayout rl_filter;
     @BindView(R2.id.tv_filter)
     TextView tv_filter;
+
+    // --- BLE / UI ---
     private boolean mReceiverTag = false;
+    private MokoBleScanner mokoBleScanner;
+    private Handler mHandler;
+    private Animation animation = null;
+
+    private LoadingDialog mLoadingDialog;
+    private LoadingMessageDialog mLoadingMessageDialog;
+
+    // --- Devices list ---
     private ConcurrentHashMap<String, BeaconXInfo> beaconXInfoHashMap;
     private final List<String> macArrivalOrder = new ArrayList<>();
+    private ArrayList<BeaconXInfo> beaconXInfos;
+    private BeaconXListAdapter adapter;
+    private BeaconXInfoParseableImpl beaconXInfoParseable;
 
+    // --- Filters ---
+    public String filterName;
+    public String filterMac;
+    public int filterRssi = -100;
+
+    // --- Connection / password flow ---
+    private String mPassword;
+    private String mSavedPassword;
+    private String mSelectedBeaconXMac;
+    private String unLockResponse;
+    private boolean mInputPassword;
+    private boolean isPasswordError;
+
+    // --- Autowrite flags ---
     private boolean mMitechAutoWriteRequested = false;
-    private boolean mStartMitechAutoWriteFlow = false;   // serve per passare l’extra a DeviceInfoActivity
-    private static final String MITECH_AUTOWRITE_PASSWORD = "20250430";
-
-    // password di default del tag (serve per Verifying/Unlock)
     private static final String DEFAULT_PASSWORD = "Moko4321";
 
+    // --- IMPORTANT: pause BLE handling when child activities control BLE ---
+    private volatile boolean mBlePausedForChild = false;
+
+    // --- Robust reconnect after forced disconnect (password verify) ---
     private String mPendingConnectMac = null;
     private boolean mWaitingDisconnectToConnect = false;
 
-
-
-    private ArrayList<BeaconXInfo> beaconXInfos;
-    private BeaconXListAdapter adapter;
-    private boolean mInputPassword;
-    private MokoBleScanner mokoBleScanner;
-    private Handler mHandler;
-    private boolean isPasswordError;
     public static String PATH_LOGCAT;
 
     @Override
@@ -132,36 +142,34 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         ButterKnife.bind(this);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    != PackageManager.PERMISSION_GRANTED) {
-
-                requestPermissions(
-                        new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
-                        1001
-                );
+            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1001);
             }
         }
 
-
-        // 初始化Xlog
+        // PATH_LOGCAT (come avevi tu)
         if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
-            // 优先保存到SD卡中
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                PATH_LOGCAT = getExternalFilesDir(null).getAbsolutePath() + File.separator + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
+                PATH_LOGCAT = getExternalFilesDir(null).getAbsolutePath() + File.separator
+                        + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
             } else {
-                PATH_LOGCAT = Environment.getExternalStorageDirectory().getAbsolutePath() + File.separator + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
+                PATH_LOGCAT = Environment.getExternalStorageDirectory().getAbsolutePath() + File.separator
+                        + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
             }
         } else {
-            // 如果SD卡不存在，就保存到本应用的目录下
-            PATH_LOGCAT = getFilesDir().getAbsolutePath() + File.separator + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
+            PATH_LOGCAT = getFilesDir().getAbsolutePath() + File.separator
+                    + (BuildConfig.IS_LIBRARY ? "mokoBeaconXPro" : "TagTastic");
         }
+
         MokoSupport.getInstance().init(getApplicationContext());
+
         beaconXInfoHashMap = new ConcurrentHashMap<>();
         beaconXInfos = new ArrayList<>();
         adapter = new BeaconXListAdapter();
         adapter.replaceData(beaconXInfos);
         adapter.setOnItemChildClickListener(this);
         adapter.openLoadAnimation();
+
         rvDevices.setLayoutManager(new LinearLayoutManager(this));
         DividerItemDecoration itemDecoration = new DividerItemDecoration(this, DividerItemDecoration.VERTICAL);
         itemDecoration.setDrawable(ContextCompat.getDrawable(this, R.drawable.shape_recycleview_divider));
@@ -170,23 +178,23 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
 
         mHandler = new Handler(Looper.getMainLooper());
         mokoBleScanner = new MokoBleScanner(this);
+
         EventBus.getDefault().register(this);
-        // 注册广播接收器
+
+        // Receiver BT state
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         registerReceiver(mReceiver, filter);
         mReceiverTag = true;
+
         if (!MokoSupport.getInstance().isBluetoothOpen()) {
-            // 蓝牙未打开，开启蓝牙
             MokoSupport.getInstance().enableBluetooth();
         } else {
-            if (animation == null) {
-                startScan();
-            }
+            if (animation == null) startScan();
         }
     }
 
-
+    // --- MENU save ---
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.main_menu, menu);
@@ -202,59 +210,55 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         return super.onOptionsItemSelected(item);
     }
 
-
-    private String unLockResponse;
+    // --- Receiver ---
     private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
-
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (intent != null) {
-                String action = intent.getAction();
-                if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
-                    int blueState = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, 0);
-                    switch (blueState) {
-                        case BluetoothAdapter.STATE_TURNING_OFF:
-                            if (animation != null) {
-                                mHandler.removeMessages(0);
-                                mokoBleScanner.stopScanDevice();
-                                onStopScan();
-                            }
-                            break;
-                        case BluetoothAdapter.STATE_ON:
-                            if (animation == null) {
-                                startScan();
-                            }
-                            break;
+            if (intent == null) return;
+            String action = intent.getAction();
+            if (!BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) return;
 
-                    }
+            int blueState = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, 0);
+            if (blueState == BluetoothAdapter.STATE_TURNING_OFF) {
+                if (animation != null) {
+                    mHandler.removeCallbacksAndMessages(null);
+                    mokoBleScanner.stopScanDevice();
+                    onStopScan();
                 }
+            } else if (blueState == BluetoothAdapter.STATE_ON) {
+                if (animation == null) startScan();
             }
         }
     };
 
+    // =========================================================
+    // EventBus BLE events
+    // =========================================================
+
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onConnectStatusEvent(ConnectStatusEvent event) {
+        if (mBlePausedForChild) return;
+
         String action = event.getAction();
 
         if (MokoConstants.ACTION_DISCONNECTED.equals(action)) {
 
-            // ✅ Se stavamo aspettando la DISCONNESSIONE per riconnettere (dopo password),
-            // NON azzerare mPassword e NON fare startScan(): riconnettiamo subito.
+            // ✅ Se stavamo aspettando la disconnessione per riconnettere (verifica password),
+            // riconnetti QUI e non fare altro (non azzerare password / non startScan).
             if (mWaitingDisconnectToConnect && !TextUtils.isEmpty(mPendingConnectMac)) {
-                dismissLoadingMessageDialog(); // chiudi eventuale "Syncing/Verifying"
-                // NON dismissLoadingProgressDialog qui se vuoi vedere la rotellina durante la riconnessione
-                // ma se la tua UI resta "bloccata", puoi anche lasciarla aperta.
-
-                final String mac = mPendingConnectMac;
+                String mac = mPendingConnectMac;
                 mPendingConnectMac = null;
                 mWaitingDisconnectToConnect = false;
 
-                // piccolo delay per stabilità stack BLE
-                mHandler.postDelayed(() -> MokoSupport.getInstance().connDevice(mac), 300);
+                dismissLoadingMessageDialog();
+                dismissLoadingProgressDialog();
+
+                showLoadingProgressDialog();
+                ivRefresh.postDelayed(() -> MokoSupport.getInstance().connDevice(mac), 200);
                 return;
             }
 
-            // --- comportamento normale ---
+            // normale disconnect
             mPassword = "";
             dismissLoadingProgressDialog();
             dismissLoadingMessageDialog();
@@ -273,15 +277,16 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
 
         if (MokoConstants.ACTION_DISCOVER_SUCCESS.equals(action)) {
             dismissLoadingProgressDialog();
-
             showLoadingMessageDialog();
+
             mHandler.postDelayed(() -> {
+                if (mBlePausedForChild) return;
+
                 if (TextUtils.isEmpty(mPassword)) {
                     ArrayList<OrderTask> orderTasks = new ArrayList<>();
                     orderTasks.add(OrderTaskAssembler.getLockState());
                     MokoSupport.getInstance().sendOrder(orderTasks.toArray(new OrderTask[]{}));
                 } else {
-                    XLog.i("锁定状态，获取unLock，解锁");
                     ArrayList<OrderTask> orderTasks = new ArrayList<>();
                     orderTasks.add(OrderTaskAssembler.getUnLock());
                     MokoSupport.getInstance().sendOrder(orderTasks.toArray(new OrderTask[]{}));
@@ -290,155 +295,170 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         }
     }
 
-
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onOrderTaskResponseEvent(OrderTaskResponseEvent event) {
+        if (mBlePausedForChild) return;
+
         final String action = event.getAction();
         if (MokoConstants.ACTION_ORDER_TIMEOUT.equals(action)) {
+            // utile per debug
+            // ToastUtils.showToast(this, "BLE timeout");
+            return;
         }
         if (MokoConstants.ACTION_ORDER_FINISH.equals(action)) {
+            return;
         }
-        if (MokoConstants.ACTION_ORDER_RESULT.equals(action)) {
-            OrderTaskResponse response = event.getResponse();
-            OrderCHAR orderCHAR = (OrderCHAR) response.orderCHAR;
-            int responseType = response.responseType;
-            byte[] value = response.responseValue;
-            switch (orderCHAR) {
-                case CHAR_LOCK_STATE: {
-                    String valueStr = MokoUtils.bytesToHexString(value);
-                    dismissLoadingMessageDialog();
+        if (!MokoConstants.ACTION_ORDER_RESULT.equals(action)) return;
 
-                    if ("00".equals(valueStr)) {
-                        // Serve password
-                        MokoSupport.getInstance().disConnectBle();
+        OrderTaskResponse response = event.getResponse();
+        OrderCHAR orderCHAR = (OrderCHAR) response.orderCHAR;
+        int responseType = response.responseType;
+        byte[] value = response.responseValue;
 
-                        if (TextUtils.isEmpty(unLockResponse)) {
-                            mInputPassword = true;
+        switch (orderCHAR) {
+            case CHAR_LOCK_STATE: {
+                String valueStr = MokoUtils.bytesToHexString(value);
+                dismissLoadingMessageDialog();
 
-                            // ✅ AUTOWRITE: usa password di default
-                            if (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1) {
-                                mSavedPassword = DEFAULT_PASSWORD;
-                            } else {
-                                mPassword = "";
-                                mSavedPassword = "";
-                            }
+                if ("00".equals(valueStr)) {
+                    // Serve password → facciamo disconnect e poi reconnect SOLO su DISCONNECTED
+                    MokoSupport.getInstance().disConnectBle();
 
-                            PasswordDialog dialog = new PasswordDialog();
-                            dialog.setPassword(mSavedPassword);
-                            dialog.setOnPasswordClicked(new PasswordDialog.PasswordClickListener() {
-                                @Override
-                                public void onEnsureClicked(String password) {
-                                    if (!MokoSupport.getInstance().isBluetoothOpen()) {
-                                        MokoSupport.getInstance().enableBluetooth();
-                                        return;
-                                    }
-                                    mPassword = password;
+                    if (TextUtils.isEmpty(unLockResponse)) {
+                        mInputPassword = true;
 
-                                    if (animation != null) {
-                                        mHandler.removeMessages(0);
-                                        mokoBleScanner.stopScanDevice();
-                                    }
-                                    showLoadingProgressDialog();
+                        boolean isAuto = (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
+                        mSavedPassword = isAuto ? DEFAULT_PASSWORD : "";
 
-// ✅ connetti SOLO dopo che la disconnessione è completata
-                                    mPendingConnectMac = mSelectedBeaconXMac;
-                                    mWaitingDisconnectToConnect = true;
-
-// sicurezza: se per qualche motivo non arriva DISCONNECTED, tenta comunque dopo 1500ms
-                                    ivRefresh.postDelayed(() -> {
-                                        if (mWaitingDisconnectToConnect && !TextUtils.isEmpty(mPendingConnectMac)) {
-                                            MokoSupport.getInstance().connDevice(mPendingConnectMac);
-                                        }
-                                    }, 1500);
-
+                        PasswordDialog dialog = new PasswordDialog();
+                        dialog.setPassword(mSavedPassword);
+                        dialog.setOnPasswordClicked(new PasswordDialog.PasswordClickListener() {
+                            @Override
+                            public void onEnsureClicked(String password) {
+                                if (!MokoSupport.getInstance().isBluetoothOpen()) {
+                                    MokoSupport.getInstance().enableBluetooth();
+                                    return;
                                 }
 
-                                @Override
-                                public void onDismiss() {
-                                    unLockResponse = "";
-                                    if (animation == null) startScan();
-                                }
-                            });
+                                mPassword = password;
 
-                            // ✅ AUTOWRITE: premi OK da solo
-                            if (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1) {
-                                dialog.setAutomaticOk();
+                                if (animation != null) {
+                                    mHandler.removeCallbacksAndMessages(null);
+                                    mokoBleScanner.stopScanDevice();
+                                }
+
+                                // ✅ aspetta DISCONNECTED e poi connetti
+                                mPendingConnectMac = mSelectedBeaconXMac;
+                                mWaitingDisconnectToConnect = true;
+
+                                showLoadingProgressDialog();
+
+                                // failsafe: se DISCONNECTED non arriva, riprova dopo 2.5s
+                                ivRefresh.postDelayed(() -> {
+                                    if (mWaitingDisconnectToConnect && !TextUtils.isEmpty(mPendingConnectMac)) {
+                                        String mac = mPendingConnectMac;
+                                        mPendingConnectMac = null;
+                                        mWaitingDisconnectToConnect = false;
+                                        MokoSupport.getInstance().connDevice(mac);
+                                    }
+                                }, 2500);
                             }
 
-                            dialog.show(NordicMainActivity.this.getSupportFragmentManager());
+                            @Override
+                            public void onDismiss() {
+                                unLockResponse = "";
+                                mInputPassword = false;
+                                if (animation == null) startScan();
+                            }
+                        });
 
-                        } else {
-                            isPasswordError = true;
-                            unLockResponse = "";
-                            ToastUtils.showToast(NordicMainActivity.this, "Password incorrect!");
-                        }
-
-                    } else if ("02".equals(valueStr)) {
-                        // Non serve password
-                        BluetoothGattCharacteristic modelNumberChar =
-                                MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
-
-                        Intent deviceInfoIntent = new Intent(NordicMainActivity.this, DeviceInfoActivity.class);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_PASSWORD, mPassword);
-                        deviceInfoIntent.putExtra(AppConstants.IS_NEW_VERSION, null == modelNumberChar);
-
-                        // ✅ passa flag autowrite
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE,
-                                mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
-
-                        mMitechAutoWriteRequested = false; // ✅ evita rientri
-                        startActivityForResult(deviceInfoIntent, AppConstants.REQUEST_CODE_DEVICE_INFO);
+                        if (isAuto) dialog.setAutomaticOk();
+                        dialog.show(getSupportFragmentManager());
 
                     } else {
-                        // Unlock OK
+                        isPasswordError = true;
                         unLockResponse = "";
-                        mSavedPassword = mPassword;
-
-                        BluetoothGattCharacteristic modelNumberChar =
-                                MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
-
-                        Intent deviceInfoIntent = new Intent(NordicMainActivity.this, DeviceInfoActivity.class);
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_PASSWORD, mPassword);
-                        deviceInfoIntent.putExtra(AppConstants.IS_NEW_VERSION, null == modelNumberChar);
-
-                        // ✅ passa flag autowrite
-                        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE,
-                                mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
-
-                        mMitechAutoWriteRequested = false; // ✅ evita rientri
-                        startActivityForResult(deviceInfoIntent, AppConstants.REQUEST_CODE_DEVICE_INFO);
+                        ToastUtils.showToast(NordicMainActivity.this, "Password incorrect!");
                     }
-                    break;
+
+                } else if ("02".equals(valueStr)) {
+                    // Non serve password
+                    openDeviceInfoAndPauseBle();
+
+                } else {
+                    // Unlock OK (già sbloccato)
+                    unLockResponse = "";
+                    mSavedPassword = mPassword;
+                    openDeviceInfoAndPauseBle();
                 }
-
-
-                case CHAR_UNLOCK:
-                    if (responseType == OrderTask.RESPONSE_TYPE_READ) {
-                        unLockResponse = MokoUtils.bytesToHexString(value);
-                        XLog.i("返回的随机数：" + unLockResponse);
-                        MokoSupport.getInstance().sendOrder(OrderTaskAssembler.setUnLock(mPassword, value));
-                    }
-                    if (responseType == OrderTask.RESPONSE_TYPE_WRITE) {
-                        MokoSupport.getInstance().sendOrder(OrderTaskAssembler.getLockState());
-                    }
-                    break;
+                break;
             }
+
+            case CHAR_UNLOCK:
+                if (responseType == OrderTask.RESPONSE_TYPE_READ) {
+                    unLockResponse = MokoUtils.bytesToHexString(value);
+                    MokoSupport.getInstance().sendOrder(OrderTaskAssembler.setUnLock(mPassword, value));
+                }
+                if (responseType == OrderTask.RESPONSE_TYPE_WRITE) {
+                    MokoSupport.getInstance().sendOrder(OrderTaskAssembler.getLockState());
+                }
+                break;
         }
     }
 
+    private void openDeviceInfoAndPauseBle() {
+        BluetoothGattCharacteristic modelNumberChar =
+                MokoSupport.getInstance().getCharacteristic(OrderCHAR.CHAR_MODEL_NUMBER);
+
+        Intent deviceInfoIntent = new Intent(NordicMainActivity.this, DeviceInfoActivity.class);
+        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_PASSWORD, mPassword);
+        deviceInfoIntent.putExtra(AppConstants.IS_NEW_VERSION, null == modelNumberChar);
+
+        boolean isAuto = (mMitechAutoWriteRequested || ((BaseApplication) getApplication()).GetMTAutoWriteStatus() == 1);
+        deviceInfoIntent.putExtra(AppConstants.EXTRA_KEY_MITECH_AUTOWRITE, isAuto);
+
+        // ✅ evita rientri
+        mMitechAutoWriteRequested = false;
+
+        // ✅ pausa NordicMainActivity: da qui in poi comanda DeviceInfoActivity/SlotDataActivity
+        mBlePausedForChild = true;
+
+        // stop scan/handler/ui
+        try {
+            if (animation != null) {
+                mHandler.removeCallbacksAndMessages(null);
+                mokoBleScanner.stopScanDevice();
+                onStopScan();
+            }
+        } catch (Exception ignore) {}
+
+        dismissLoadingProgressDialog();
+        dismissLoadingMessageDialog();
+
+        mHandler.removeCallbacksAndMessages(null);
+
+        startActivityForResult(deviceInfoIntent, AppConstants.REQUEST_CODE_DEVICE_INFO);
+    }
+
+    // =========================================================
+    // Activity result: resume BLE control here
+    // =========================================================
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (resultCode == RESULT_OK) {
-            switch (requestCode) {
-                case AppConstants.REQUEST_CODE_DEVICE_INFO:
-                    mPassword = "";
-                    if (animation == null) {
-                        startScan();
-                    }
-                    break;
 
-            }
+        if (requestCode == AppConstants.REQUEST_CODE_DEVICE_INFO) {
+            mBlePausedForChild = false;
+
+            dismissLoadingProgressDialog();
+            dismissLoadingMessageDialog();
+
+            mPassword = "";
+            unLockResponse = "";
+            mInputPassword = false;
+            isPasswordError = false;
+
+            if (animation == null) startScan();
         }
     }
 
@@ -447,54 +467,41 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         super.onDestroy();
         if (mReceiverTag) {
             mReceiverTag = false;
-            // 注销广播
             unregisterReceiver(mReceiver);
         }
         EventBus.getDefault().unregister(this);
     }
 
-
+    // =========================================================
+    // Scanner callbacks
+    // =========================================================
     @Override
     public void onStartScan() {
         beaconXInfoHashMap.clear();
         macArrivalOrder.clear();
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                while (animation != null) {
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            adapter.replaceData(beaconXInfos);
-                            tvDeviceNum.setText(String.format("DEVICE(%d)", beaconXInfos.size()));
-                        }
-                    });
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                    updateDevices();
+        new Thread(() -> {
+            while (animation != null) {
+                runOnUiThread(() -> {
+                    adapter.replaceData(beaconXInfos);
+                    tvDeviceNum.setText(String.format(Locale.getDefault(), "DEVICE(%d)", beaconXInfos.size()));
+                });
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ignored) {
                 }
+                updateDevices();
             }
         }).start();
     }
 
-    private BeaconXInfoParseableImpl beaconXInfoParseable;
-
     @Override
     public void onScanDevice(DeviceInfo deviceInfo) {
+        if (beaconXInfoParseable == null) beaconXInfoParseable = new BeaconXInfoParseableImpl();
         BeaconXInfo beaconXInfo = beaconXInfoParseable.parseDeviceInfo(deviceInfo);
-        if (beaconXInfo == null)
-            return;
+        if (beaconXInfo == null) return;
+
         String mac = beaconXInfo.mac;
-
-// se è un MAC nuovo, aggiungilo alla lista dell’ordine
-        if (!beaconXInfoHashMap.containsKey(mac)) {
-            macArrivalOrder.add(mac);
-        }
-
-// aggiorna comunque i dati dell’hashmap
+        if (!beaconXInfoHashMap.containsKey(mac)) macArrivalOrder.add(mac);
         beaconXInfoHashMap.put(mac, beaconXInfo);
     }
 
@@ -506,9 +513,7 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
 
     private void updateDevices() {
         beaconXInfos.clear();
-        if (!TextUtils.isEmpty(filterName)
-                || !TextUtils.isEmpty(filterMac)
-                || filterRssi != -100) {
+        if (!TextUtils.isEmpty(filterName) || !TextUtils.isEmpty(filterMac) || filterRssi != -100) {
             ArrayList<BeaconXInfo> beaconXInfosFilter = new ArrayList<>(beaconXInfoHashMap.values());
             Iterator<BeaconXInfo> iterator = beaconXInfosFilter.iterator();
             while (iterator.hasNext()) {
@@ -519,7 +524,7 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
                     } else {
                         if (!TextUtils.isEmpty(filterMac) && TextUtils.isEmpty(beaconXInfo.mac)) {
                             iterator.remove();
-                        } else if (!TextUtils.isEmpty(filterMac) && beaconXInfo.mac.toLowerCase().replaceAll(":", "").contains(filterMac.toLowerCase())) {
+                        } else if (!TextUtils.isEmpty(filterMac) && beaconXInfo.mac.toLowerCase().replace(":", "").contains(filterMac.toLowerCase())) {
                             continue;
                         } else if (!TextUtils.isEmpty(filterName) && TextUtils.isEmpty(beaconXInfo.name)) {
                             iterator.remove();
@@ -537,28 +542,16 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         } else {
             beaconXInfos.addAll(beaconXInfoHashMap.values());
         }
-        System.setProperty("java.util.Arrays.useLegacyMergeSort", "true");
-        Collections.sort(beaconXInfos, new Comparator<BeaconXInfo>() {
-            @Override
-            public int compare(BeaconXInfo lhs, BeaconXInfo rhs) {
-                if (lhs.rssi > rhs.rssi) {
-                    return -1;
-                } else if (lhs.rssi < rhs.rssi) {
-                    return 1;
-                }
-                return 0;
-            }
+
+        Collections.sort(beaconXInfos, (lhs, rhs) -> {
+            if (lhs.rssi > rhs.rssi) return -1;
+            if (lhs.rssi < rhs.rssi) return 1;
+            return 0;
         });
     }
 
-    private Animation animation = null;
-    public String filterName;
-    public String filterMac;
-    public int filterRssi = -100;
-
     private void startScan() {
         if (!MokoSupport.getInstance().isBluetoothOpen()) {
-            // 蓝牙未打开，开启蓝牙
             MokoSupport.getInstance().enableBluetooth();
             return;
         }
@@ -568,60 +561,42 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         mokoBleScanner.startScanDevice(this);
     }
 
-
-    private LoadingDialog mLoadingDialog;
-
+    // =========================================================
+    // Dialog helpers
+    // =========================================================
     private void showLoadingProgressDialog() {
         mLoadingDialog = new LoadingDialog();
         mLoadingDialog.show(getSupportFragmentManager());
-
     }
 
     private void dismissLoadingProgressDialog() {
-        if (mLoadingDialog != null)
-            mLoadingDialog.dismissAllowingStateLoss();
+        if (mLoadingDialog != null) mLoadingDialog.dismissAllowingStateLoss();
     }
-
-    private LoadingMessageDialog mLoadingMessageDialog;
 
     private void showLoadingMessageDialog() {
         mLoadingMessageDialog = new LoadingMessageDialog();
         mLoadingMessageDialog.setMessage("Verifying..");
         mLoadingMessageDialog.show(getSupportFragmentManager());
-
     }
 
     private void dismissLoadingMessageDialog() {
-        if (mLoadingMessageDialog != null)
-            mLoadingMessageDialog.dismissAllowingStateLoss();
+        if (mLoadingMessageDialog != null) mLoadingMessageDialog.dismissAllowingStateLoss();
     }
 
-    @Override
-    public void onBackPressed() {
-        back();
-    }
-
-    private String mPassword;
-    private String mSavedPassword;
-    private String mSelectedBeaconXMac;
-
-
+    // =========================================================
+    // UI actions
+    // =========================================================
     @Override
     public void onItemChildClick(BaseQuickAdapter adapter, View view, int position) {
-
         int viewId = view.getId();
 
         if (viewId == R.id.tv_connect) {
-            Toast.makeText(this, "tv_connect cliccato!", Toast.LENGTH_SHORT).show();
             ((BaseApplication) getApplication()).SetMTAutoWriteStatus(0);
             mMitechAutoWriteRequested = false;
-            mStartMitechAutoWriteFlow = false;
         } else if (viewId == R.id.tv_mtautowrite) {
-            Toast.makeText(this, "tv_mtautowrite cliccato!", Toast.LENGTH_SHORT).show();
-            ((BaseApplication)getApplication()).SetMTAutoWriteStatus(1);
-            mMitechAutoWriteRequested = true; // ✅ serve per auto inserire la password di default
+            ((BaseApplication) getApplication()).SetMTAutoWriteStatus(1);
+            mMitechAutoWriteRequested = true;
         }
-
 
         if (!MokoSupport.getInstance().isBluetoothOpen()) {
             MokoSupport.getInstance().enableBluetooth();
@@ -631,101 +606,123 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         final BeaconXInfo beaconXInfo = (BeaconXInfo) adapter.getItem(position);
         if (beaconXInfo != null && !isFinishing()) {
             if (animation != null) {
-                mHandler.removeMessages(0);
+                mHandler.removeCallbacksAndMessages(null);
                 mokoBleScanner.stopScanDevice();
+                onStopScan();
             }
             mSelectedBeaconXMac = beaconXInfo.mac;
+
             showLoadingProgressDialog();
             ivRefresh.postDelayed(() -> MokoSupport.getInstance().connDevice(beaconXInfo.mac), 500);
         }
     }
 
-
     public void onBack(View view) {
-        if (isWindowLocked())
-            return;
+        if (isWindowLocked()) return;
         back();
     }
 
     public void onAbout(View view) {
-        if (isWindowLocked())
-            return;
+        if (isWindowLocked()) return;
         startActivity(new Intent(this, AboutActivity.class));
     }
 
     public void onFilter(View view) {
-        if (isWindowLocked())
-            return;
+        if (isWindowLocked()) return;
+
         if (animation != null) {
-            mHandler.removeMessages(0);
+            mHandler.removeCallbacksAndMessages(null);
             mokoBleScanner.stopScanDevice();
+            onStopScan();
         }
+
         ScanFilterDialog scanFilterDialog = new ScanFilterDialog(this);
         scanFilterDialog.setFilterName(filterName);
         scanFilterDialog.setFilterMac(filterMac);
         scanFilterDialog.setFilterRssi(filterRssi);
+
         scanFilterDialog.setOnScanFilterListener((filterName, filterMac, filterRssi) -> {
             NordicMainActivity.this.filterName = filterName;
             NordicMainActivity.this.filterMac = filterMac;
-            String showFilterMac = "";
+
+            String showFilterMac;
             if (filterMac.length() == 12) {
-                StringBuffer stringBuffer = new StringBuffer(filterMac);
-                stringBuffer.insert(2, ":");
-                stringBuffer.insert(5, ":");
-                stringBuffer.insert(8, ":");
-                stringBuffer.insert(11, ":");
-                stringBuffer.insert(14, ":");
-                showFilterMac = stringBuffer.toString();
+                StringBuilder sb = new StringBuilder(filterMac);
+                sb.insert(2, ":");
+                sb.insert(5, ":");
+                sb.insert(8, ":");
+                sb.insert(11, ":");
+                sb.insert(14, ":");
+                showFilterMac = sb.toString();
             } else {
                 showFilterMac = filterMac;
             }
+
             NordicMainActivity.this.filterRssi = filterRssi;
-            if (!TextUtils.isEmpty(filterName)
-                    || !TextUtils.isEmpty(showFilterMac)
-                    || filterRssi != -100) {
+
+            if (!TextUtils.isEmpty(filterName) || !TextUtils.isEmpty(showFilterMac) || filterRssi != -100) {
                 rl_filter.setVisibility(View.VISIBLE);
                 rl_edit_filter.setVisibility(View.GONE);
+
                 StringBuilder stringBuilder = new StringBuilder();
-                if (!TextUtils.isEmpty(filterName)) {
-                    stringBuilder.append(filterName);
-                    stringBuilder.append(";");
-                }
-                if (!TextUtils.isEmpty(showFilterMac)) {
-                    stringBuilder.append(showFilterMac);
-                    stringBuilder.append(";");
-                }
-                if (filterRssi != -100) {
-                    stringBuilder.append(String.format("%sdBm", filterRssi + ""));
-                    stringBuilder.append(";");
-                }
+                if (!TextUtils.isEmpty(filterName)) stringBuilder.append(filterName).append(";");
+                if (!TextUtils.isEmpty(showFilterMac)) stringBuilder.append(showFilterMac).append(";");
+                if (filterRssi != -100) stringBuilder.append(String.format(Locale.getDefault(), "%sdBm;", String.valueOf(filterRssi)));
                 tv_filter.setText(stringBuilder.toString());
             } else {
                 rl_filter.setVisibility(View.GONE);
                 rl_edit_filter.setVisibility(View.VISIBLE);
             }
-            if (isWindowLocked())
-                return;
-            if (animation == null) {
-                startScan();
-            }
+
+            if (animation == null) startScan();
         });
-        scanFilterDialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
-            @Override
-            public void onDismiss(DialogInterface dialog) {
-                if (isWindowLocked())
-                    return;
-                if (animation == null) {
-                    startScan();
-                }
-            }
+
+        scanFilterDialog.setOnDismissListener(dialog -> {
+            if (isWindowLocked()) return;
+            if (animation == null) startScan();
         });
+
         scanFilterDialog.show();
+    }
+
+    public void onRefresh(View view) {
+        if (isWindowLocked()) return;
+
+        if (!MokoSupport.getInstance().isBluetoothOpen()) {
+            MokoSupport.getInstance().enableBluetooth();
+            return;
+        }
+
+        if (animation == null) {
+            startScan();
+        } else {
+            mHandler.removeCallbacksAndMessages(null);
+            mokoBleScanner.stopScanDevice();
+            onStopScan();
+        }
+    }
+
+    public void onFilterDelete(View view) {
+        if (animation != null) {
+            mHandler.removeCallbacksAndMessages(null);
+            mokoBleScanner.stopScanDevice();
+            onStopScan();
+        }
+        rl_filter.setVisibility(View.GONE);
+        rl_edit_filter.setVisibility(View.VISIBLE);
+        filterName = "";
+        filterMac = "";
+        filterRssi = -100;
+
+        if (isWindowLocked()) return;
+        if (animation == null) startScan();
     }
 
     private void back() {
         if (animation != null) {
-            mHandler.removeMessages(0);
+            mHandler.removeCallbacksAndMessages(null);
             mokoBleScanner.stopScanDevice();
+            onStopScan();
         }
         if (BuildConfig.IS_LIBRARY) {
             finish();
@@ -737,102 +734,49 @@ public class NordicMainActivity extends BaseActivity implements MokoScanDeviceCa
         }
     }
 
-    public void onRefresh(View view) {
-        if (isWindowLocked())
-            return;
-        if (!MokoSupport.getInstance().isBluetoothOpen()) {
-            // 蓝牙未打开，开启蓝牙
-            MokoSupport.getInstance().enableBluetooth();
-            return;
-        }
-        if (animation == null) {
-            startScan();
-        } else {
-            mHandler.removeMessages(0);
-            mokoBleScanner.stopScanDevice();
-        }
-    }
-
-    public void onFilterDelete(View view) {
-        if (animation != null) {
-            mHandler.removeMessages(0);
-            mokoBleScanner.stopScanDevice();
-        }
-        rl_filter.setVisibility(View.GONE);
-        rl_edit_filter.setVisibility(View.VISIBLE);
-        filterName = "";
-        filterMac = "";
-        filterRssi = -100;
-        if (isWindowLocked())
-            return;
-        if (animation == null) {
-            startScan();
-        }
-    }
-
-
+    // =========================================================
+    // Save MAC list
+    // =========================================================
     private void saveMacListToFile() {
         try {
-            // cartella Download
             File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             if (!dir.exists()) dir.mkdirs();
 
-            // nome file con data (solo giorno) – ad es. 2025-12-10_MAC_LIST.txt
             String today = new SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(new Date());
             File file = new File(dir, today + "_MAC_LIST.txt");
 
-            // 1) costruiamo il blocco NUOVO da mettere in alto
-            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-                    .format(new Date());
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date());
 
             StringBuilder newBlock = new StringBuilder();
             newBlock.append("---- Scansione del ").append(timestamp).append(" ----\n");
 
-            // lista MAC in ordine: più recenti in alto
             List<String> macList = new ArrayList<>(macArrivalOrder);
             Collections.reverse(macList);
-
-            for (String mac : macList) {
-                newBlock.append(mac).append("\n");
-            }
+            for (String mac : macList) newBlock.append(mac).append("\n");
             newBlock.append("\n");
 
-            // 2) leggiamo il vecchio contenuto (se esiste)
             StringBuilder oldContent = new StringBuilder();
             if (file.exists()) {
                 java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(file));
                 String line;
-                while ((line = br.readLine()) != null) {
-                    oldContent.append(line).append("\n");
-                }
+                while ((line = br.readLine()) != null) oldContent.append(line).append("\n");
                 br.close();
             }
 
-            // 3) riscriviamo il file: prima il blocco nuovo, poi il vecchio contenuto
-            FileWriter writer = new FileWriter(file, false); // false = sovrascrivi
+            FileWriter writer = new FileWriter(file, false);
             writer.write(newBlock.toString());
             writer.write(oldContent.toString());
             writer.close();
 
-            Toast.makeText(this,
-                    "Mac salvati in: " + file.getAbsolutePath(),
-                    Toast.LENGTH_LONG).show();
-
+            Toast.makeText(this, "Mac salvati in: " + file.getAbsolutePath(), Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             e.printStackTrace();
             Toast.makeText(this, "Errore durante il salvataggio", Toast.LENGTH_SHORT).show();
         }
     }
 
-
-
-
     public void onSave(View view) {
-        if (isWindowLocked())
-            return;
+        if (isWindowLocked()) return;
         saveMacListToFile();
     }
-
 }
-
-

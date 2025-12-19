@@ -1,5 +1,8 @@
 package com.moko.bxp.nordic.autowrite;
 
+import android.os.Handler;
+import android.os.Looper;
+
 import com.moko.ble.lib.MokoConstants;
 import com.moko.ble.lib.event.ConnectStatusEvent;
 import com.moko.ble.lib.event.OrderTaskResponseEvent;
@@ -25,10 +28,13 @@ public class MitechAutoWriteController {
 
     private enum State {
         IDLE,
-        SEND_SLOT1_URL_BATCH,
-        WAIT_SLOT_BATCH_FINISH,
+
+        SEND_SLOT_URL_AND_RADIO,
+        WAIT_SLOT_URL_AND_RADIO_FINISH,
+
         SEND_PASSWORD_CHANGE,
         WAIT_PASSWORD_CHANGE_DISCONNECT,
+
         DONE,
         FAIL
     }
@@ -36,12 +42,28 @@ public class MitechAutoWriteController {
     private final DeviceInfoActivity activity;
     private final Listener listener;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
     private State state = State.IDLE;
     private boolean running = false;
 
-    private boolean slotConfigError = false;
+    // set true when firmware reports "params not accepted" (0x0D)
+    private boolean configError = false;
 
+    // REQUIRED
     private static final String NEW_PASSWORD = "20250430";
+
+    // REQUIRED URL: https://www.mtsystem.it/
+    private static final SlotEnum TARGET_SLOT = SlotEnum.SLOT_1;
+    private static final String URL_CONTENT = "mtsystem.it/"; // scheme provides https://www.
+
+    // Radio params (safe / compatible)
+    private static final int TX_POWER_DBM = 4;      // Radio TX Power
+    private static final int RSSI_0M_DBM = -59;     // Adv TX Power (RSSI@0m)
+    private static final int ADV_INTERVAL_MS = 1000; // 1000ms (your UI "10" => 1000ms)
+
+    // pacing
+    private static final long STEP_DELAY_MS = 200;
 
     public MitechAutoWriteController(DeviceInfoActivity activity, Listener listener) {
         this.activity = activity;
@@ -54,17 +76,24 @@ public class MitechAutoWriteController {
 
     public void start() {
         if (running) return;
+
         running = true;
-        slotConfigError = false;
-        state = State.SEND_SLOT1_URL_BATCH;
+        configError = false;
+        state = State.SEND_SLOT_URL_AND_RADIO;
+
         activity.showSyncingProgressDialog();
+
+        // IMPORTANT: stop any delayed tasks in the Activity that could send BLE orders
+        activity.cancelPendingUiAndBleRunnablesForAutoWrite();
+
         advance();
     }
 
-    public void stopFail(String reason) {
+    private void stopFail(String reason) {
         if (!running) return;
         running = false;
         state = State.FAIL;
+
         activity.dismissSyncProgressDialog();
         if (listener != null) listener.onFailed(reason);
     }
@@ -73,49 +102,49 @@ public class MitechAutoWriteController {
         if (!running) return;
         running = false;
         state = State.DONE;
+
         activity.dismissSyncProgressDialog();
         if (listener != null) listener.onCompleted();
     }
 
     private void advance() {
+        if (!running) return;
+
         switch (state) {
 
-            case SEND_SLOT1_URL_BATCH: {
-                // SLOT 1 -> URL
+            case SEND_SLOT_URL_AND_RADIO: {
+                // IMPORTANT:
+                // Radio params are per-slot in this firmware stack (UrlFragment does setSlot before radio params),
+                // so we MUST setSlot in the same batch to avoid "parametri radio non accettati".
                 ArrayList<OrderTask> tasks = new ArrayList<>();
-                tasks.add(OrderTaskAssembler.setSlot(SlotEnum.SLOT_1));
+                tasks.add(OrderTaskAssembler.setSlot(TARGET_SLOT));
 
-                // URL: https://www.mitechsystem.it
-                // Eddystone URL: frameType + scheme + content
-                String frameTypeHex = SlotFrameTypeEnum.URL.getFrameType(); // di solito "10"
-                String schemeHex = MokoUtils.int2HexString(UrlSchemeEnum.HTTPS_WWW.getUrlType()); // 0x01
-                String urlContentHex = MokoUtils.string2Hex("mitechsystem.it"); // .it non è in tabella espansione
+                // Build Eddystone-URL params: [frameType][scheme][urlContent]
+                String frameTypeHex = SlotFrameTypeEnum.URL.getFrameType();
+                String schemeHex = MokoUtils.int2HexString(UrlSchemeEnum.HTTPS_WWW.getUrlType());
+                String urlContentHex = MokoUtils.string2Hex(URL_CONTENT);
                 byte[] urlParams = MokoUtils.hex2bytes(frameTypeHex + schemeHex + urlContentHex);
 
+                // Send slot data + radio params in the same order used by UrlFragment.sendData()
                 tasks.add(OrderTaskAssembler.setSlotData(urlParams));
+                tasks.add(OrderTaskAssembler.setRadioTxPower(MokoUtils.toByteArray(TX_POWER_DBM, 1)));
+                tasks.add(OrderTaskAssembler.setRssi(MokoUtils.toByteArray(RSSI_0M_DBM, 1)));
+                tasks.add(OrderTaskAssembler.setAdvInterval(MokoUtils.toByteArray(ADV_INTERVAL_MS, 2)));
 
-                // TX Power: 4 dBm
-                tasks.add(OrderTaskAssembler.setRadioTxPower(MokoUtils.toByteArray(4, 1)));
+                configError = false;
+                state = State.WAIT_SLOT_URL_AND_RADIO_FINISH;
 
-                // RSSI@0m: 0 dBm (come nel tuo SetMitechValoriTag)
-                tasks.add(OrderTaskAssembler.setRssi(MokoUtils.toByteArray(0, 1)));
-
-                // Adv Interval: 1000ms (nel tuo codice: advIntervalInt*100, quindi 10->1000)
-                tasks.add(OrderTaskAssembler.setAdvInterval(MokoUtils.toByteArray(1000, 2)));
-
-                slotConfigError = false;
-                state = State.WAIT_SLOT_BATCH_FINISH;
-                MokoSupport.getInstance().sendOrder(tasks.toArray(new OrderTask[]{}));
+                MokoSupport.getInstance().sendOrder(tasks.toArray(new OrderTask[0]));
                 break;
             }
 
             case SEND_PASSWORD_CHANGE: {
-                // Cambio password: 20250430
-                // Importantissimo: prevenire popup disconnect in DeviceInfoActivity
+                // Password change triggers disconnect after success.
                 activity.markExpectingAutoWritePasswordDisconnect();
-
                 state = State.WAIT_PASSWORD_CHANGE_DISCONNECT;
-                activity.modifyPassword(NEW_PASSWORD); // usa la tua pipeline già pronta (setLockState)
+
+                // MUST send password twice when supported (DeviceInfoActivity handles it)
+                activity.modifyPasswordForAutoWrite(NEW_PASSWORD);
                 break;
             }
 
@@ -126,13 +155,18 @@ public class MitechAutoWriteController {
 
     public void onConnectStatusEvent(ConnectStatusEvent event) {
         if (!running) return;
+
         final String action = event.getAction();
 
         if (MokoConstants.ACTION_DISCONNECTED.equals(action)) {
-            // Se disconnette in un momento non previsto, è failure.
-            if (state != State.WAIT_PASSWORD_CHANGE_DISCONNECT) {
-                stopFail("Autowrite fallito: disconnessione inattesa");
+            // During password-change flow, disconnect is expected = SUCCESS
+            if (state == State.WAIT_PASSWORD_CHANGE_DISCONNECT) {
+                stopOk();
+                return;
             }
+
+            // Otherwise it's unexpected
+            stopFail("Autowrite fallito: disconnessione inattesa");
         }
     }
 
@@ -146,19 +180,6 @@ public class MitechAutoWriteController {
             return;
         }
 
-        if (MokoConstants.ACTION_ORDER_FINISH.equals(action)) {
-            if (state == State.WAIT_SLOT_BATCH_FINISH) {
-                if (slotConfigError) {
-                    stopFail("Autowrite fallito: salvataggio slot non riuscito");
-                } else {
-                    state = State.SEND_PASSWORD_CHANGE;
-                    advance();
-                }
-            }
-            return;
-        }
-
-        // Intercettiamo errori “config” come fa SlotDataActivity (key == 0x0D)
         if (MokoConstants.ACTION_ORDER_RESULT.equals(action)) {
             OrderTaskResponse response = event.getResponse();
             if (response == null) return;
@@ -166,16 +187,26 @@ public class MitechAutoWriteController {
             OrderCHAR orderCHAR = (OrderCHAR) response.orderCHAR;
             byte[] value = response.responseValue;
 
+            // Same rule used in SlotDataActivity: CHAR_PARAMS key==0x0D => params not accepted
             if (orderCHAR == OrderCHAR.CHAR_PARAMS && value != null && value.length > 1) {
                 int key = value[1] & 0xFF;
                 if (key == 0x0D) {
-                    slotConfigError = true;
+                    configError = true;
                 }
             }
         }
 
-        // La “success” del cambio password nel tuo progetto passa da:
-        // CHAR_DISCONNECT con mDisconnectType == 1 + isModifyPassword true
-        // e poi la UI fa finish(). Qui non facciamo altro: DeviceInfoActivity chiuderà e noi completiamo lì.
+        if (MokoConstants.ACTION_ORDER_FINISH.equals(action)) {
+
+            if (state == State.WAIT_SLOT_URL_AND_RADIO_FINISH) {
+                if (configError) {
+                    stopFail("Autowrite fallito: parametri non accettati (radio/url)");
+                    return;
+                }
+
+                state = State.SEND_PASSWORD_CHANGE;
+                mainHandler.postDelayed(this::advance, STEP_DELAY_MS);
+            }
+        }
     }
 }
